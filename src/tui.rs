@@ -1,6 +1,8 @@
 use std::{error::Error, io, path::PathBuf, process::Command, env};
 use std::io::Write as IoWrite;
 use tempfile::NamedTempFile;
+use serde::Serialize;
+use serde_yaml;
 use std::time::{Instant, Duration};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, MouseButton},
@@ -299,19 +301,33 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                                         let id = app.items[idx].3;
                                         let mut name = String::new();
                                         let mut data = String::new();
+                                        let mut tags: Vec<String> = Vec::new();
                                         if let Some(li) = app.find_locked_index_by_id(id) {
                                             let info = app.wiki.info[li].read();
                                             name = info.name.clone();
                                             data = info.data.clone();
+                                            tags = info.tags.clone();
                                             drop(info);
                                         }
 
-                                        // write to temp file in format: TITLE\n---\nCONTENT
+                                        // write to temp file with YAML frontmatter:
+                                        // ---
+                                        // title: ...
+                                        // tags: [..]
+                                        // ---
+                                        // CONTENT
+                                        #[derive(Serialize)]
+                                        struct Front<'a> {
+                                            title: &'a str,
+                                            tags: &'a Vec<String>,
+                                        }
+
                                         let mut tmp = match NamedTempFile::new() {
                                             Ok(t) => t,
                                             Err(_) => return Ok(()),
                                         };
-                                        let payload = format!("{}\n---\n{}", name, data);
+                                        let fm = serde_yaml::to_string(&Front { title: &name, tags: &tags }).unwrap_or_default();
+                                        let payload = format!("---\n{}---\n\n{}", fm, data);
                                         let _ = tmp.write_all(payload.as_bytes());
                                         let tmp_path = tmp.path().to_owned();
 
@@ -326,18 +342,50 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
 
                                         // read edited contents back
                                         let edited = std::fs::read_to_string(&tmp_path).unwrap_or_default();
-                                        // parse: first line = title, optional second line '---', rest = content
-                                        let mut lines = edited.lines();
-                                        let new_title = lines.next().unwrap_or("").to_string();
-                                        let second = lines.next();
-                                        let rest = if second == Some("---") {
-                                            lines.collect::<Vec<_>>().join("\n")
+                                        // parse YAML frontmatter if present
+                                        let mut new_title = String::new();
+                                        let mut new_tags: Option<Vec<String>> = None;
+                                        let mut rest = String::new();
+                                        let cursor = edited.as_str();
+                                        if cursor.trim_start().starts_with("---") {
+                                            // find the frontmatter block
+                                            if let Some(pos) = cursor.find("\n---") {
+                                                let fm_block = &cursor[4..pos+1];
+                                                // parse YAML
+                                                if let Ok(fm_val) = serde_yaml::from_str::<serde_yaml::Value>(fm_block) {
+                                                    if let Some(t) = fm_val.get("title") {
+                                                        if let Some(s) = t.as_str() { new_title = s.to_string(); }
+                                                    }
+                                                    if let Some(tg) = fm_val.get("tags") {
+                                                        if let Some(arr) = tg.as_sequence() {
+                                                            let parsed: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                                                            new_tags = Some(parsed);
+                                                        }
+                                                    }
+                                                }
+                                                // remainder after the closing '---' (skip the newline)
+                                                let rest_start = pos + 5; // skip '\n---' and following newline
+                                                if rest_start < cursor.len() {
+                                                    rest = cursor[rest_start..].trim_start_matches('\n').to_string();
+                                                }
+                                            } else {
+                                                // no closing delimiter; treat whole as content
+                                                rest = edited;
+                                            }
                                         } else {
-                                            let mut v = Vec::new();
-                                            if let Some(s) = second { v.push(s); }
-                                            v.extend(lines);
-                                            v.join("\n")
-                                        };
+                                            // fallback: first line title, optional '---' separator
+                                            let mut lines = edited.lines();
+                                            new_title = lines.next().unwrap_or("").to_string();
+                                            let second = lines.next();
+                                            if second == Some("---") {
+                                                rest = lines.collect::<Vec<_>>().join("\n");
+                                            } else {
+                                                let mut v = Vec::new();
+                                                if let Some(s) = second { v.push(s); }
+                                                v.extend(lines);
+                                                rest = v.join("\n");
+                                            }
+                                        }
 
                                         // re-enter tui
                                         let mut stdout = io::stdout();
@@ -348,7 +396,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                                         if let Some(li) = app.find_locked_index_by_id(id) {
                                             if let Some(locked) = app.wiki.info.get(li) {
                                                 let mut w = locked.write();
-                                                w.name = new_title.trim().to_string();
+                                                if !new_title.trim().is_empty() {
+                                                    w.name = new_title.trim().to_string();
+                                                }
+                                                if let Some(ntags) = new_tags {
+                                                    w.tags = ntags;
+                                                }
                                                 w.data = rest;
                                             }
                                         }
